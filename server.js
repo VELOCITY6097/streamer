@@ -139,4 +139,3 @@ app.get('/play', (req, res) => {
     }
 });
 
-app.listen(PORT, () => console.log(`Transcoding Engine running on http://localhost:${PORT}`));
