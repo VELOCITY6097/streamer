@@ -1,0 +1,181 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Plyr Torrent Streamer</title>
+    
+    <!-- Plyr CSS -->
+    <link rel="stylesheet" href="https://cdn.plyr.io/3.7.8/plyr.css" />
+    
+    <style>
+        /* --- PAGE LAYOUT --- */
+        body {
+            margin: 0;
+            background-color: #141414; /* Netflix Dark Background */
+            color: #e5e5e5;
+            font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            min-height: 100vh;
+            padding: 20px;
+            box-sizing: border-box;
+            overflow: hidden; /* Prevents accidental scrolling when using spacebar */
+        }
+
+        .header-panel {
+            text-align: center;
+            margin-bottom: 20px;
+            width: 100%;
+            max-width: 1000px;
+        }
+
+        .header-panel h2 { color: #e50914; margin-bottom: 5px; }
+
+        .player-container {
+            width: 100%;
+            max-width: 1000px;
+            aspect-ratio: 16/9;
+            box-shadow: 0 20px 50px rgba(0,0,0,0.9);
+            background: #000;
+            border-radius: 8px;
+            position: relative;
+            /* Prevents the video from spilling out of the rounded corners */
+            overflow: hidden; 
+        }
+
+        #status {
+            margin-top: 20px;
+            font-size: 14px;
+            color: #b3b3b3;
+            background: rgba(255,255,255,0.05);
+            padding: 10px 20px;
+            border-radius: 20px;
+        }
+
+        /* -------------------------------------------------------------------------- */
+        /* PLYR NETFLIX RED & BLACK THEME OVERRIDES                                   */
+        /* -------------------------------------------------------------------------- */
+        
+        :root {
+            /* Main theme color (Progress bar, Volume bar, active settings) */
+            --plyr-color-main: #e50914; 
+            
+            /* Hover states for buttons */
+            --plyr-video-control-background-hover: rgba(229, 9, 20, 0.8);
+            
+            /* Control bar background - sleek dark glass fading up */
+            --plyr-video-controls-background: linear-gradient(rgba(0,0,0,0), rgba(15,15,15,0.95));
+            
+            /* Tooltip popups (when hovering over progress bar or buttons) */
+            --plyr-tooltip-background: rgba(20, 20, 20, 0.95);
+            --plyr-tooltip-color: #ffffff;
+            
+            /* Settings menu background */
+            --plyr-menu-background: rgba(20, 20, 20, 0.95);
+            --plyr-menu-color: #ffffff;
+            --plyr-menu-border-color: rgba(255, 255, 255, 0.1);
+        }
+
+        /* Make the big play button in the center red and circular */
+        .plyr__control--overlaid {
+            background: rgba(229, 9, 20, 0.8) !important;
+            border-radius: 50% !important;
+            padding: 20px !important;
+        }
+        
+        .plyr__control--overlaid:hover {
+            background: #e50914 !important;
+            transform: scale(1.1);
+        }
+
+        /* Remove the annoying blue focus outline browsers add */
+        .plyr:focus-within {
+            outline: none !important;
+        }
+    </style>
+</head>
+<body>
+
+    <div class="header-panel">
+        <h2>Now Streaming</h2>
+    </div>
+
+    <!-- The Player Container -->
+    <div class="player-container" id="player-wrapper" style="display: none;">
+        <!-- Plyr targets a standard HTML5 video tag -->
+        <video id="player" playsinline controls preload="auto">
+            <!-- Source will be injected by JS -->
+        </video>
+    </div>
+
+    <div id="status">Connecting to server...</div>
+
+    <!-- Plyr JS Library -->
+    <script src="https://cdn.plyr.io/3.7.8/plyr.js"></script>
+
+    <script>
+        const urlParams = new URLSearchParams(window.location.search);
+        const infoHash = urlParams.get('hash');
+
+        if (!infoHash) {
+            document.getElementById('status').innerText = "Error: No hash provided in the URL.";
+        } else {
+            const videoElement = document.getElementById('player');
+            const playerWrapper = document.getElementById('player-wrapper');
+            
+            // 1. Connect to your Express streaming backend
+            videoElement.src = `/api/stream/${infoHash}?res=source`;
+            playerWrapper.style.display = 'block';
+
+            // 2. Initialize Plyr
+            const player = new Plyr('#player', {
+                autoplay: true,
+                keyboard: {
+                    focused: true,
+                    // THIS IS THE MAGIC FIX: "global: true" forces Plyr to listen to the Spacebar 
+                    // and Arrow keys even if you click off the video onto the black background!
+                    global: true 
+                },
+                controls: [
+                    'play-large',   // The large play button in the center
+                    'play',         // Play/pause playback
+                    'progress',     // The progress bar and scrubber for playback and buffering
+                    'current-time', // The current time of playback
+                    'duration',     // The full duration of the media
+                    'mute',         // Toggle mute
+                    'volume',       // Volume control
+                    'settings',     // Settings menu (speed, quality)
+                    'pip',          // Picture-in-picture (currently Safari only)
+                    'fullscreen'    // Toggle fullscreen
+                ],
+                speed: {
+                    selected: 1,
+                    options: [0.5, 0.75, 1, 1.25, 1.5, 2]
+                }
+            });
+
+            // 3. Fetch server stats
+            setInterval(async () => {
+                try {
+                    const response = await fetch('/api/stats');
+                    const data = await response.json();
+                    
+                    if (data.status === 'downloading') {
+                        const progress = (data.progress * 100).toFixed(1);
+                        const speed = (data.downloadSpeed / 1024 / 1024).toFixed(2);
+                        
+                        document.getElementById('status').innerText = 
+                            `Streaming: ${progress}% | Server Speed: ${speed} MB/s | Peers: ${data.numPeers}`;
+                    }
+                } catch (err) {
+                    // Silently ignore background stat errors so the player isn't interrupted
+                }
+            }, 1000);
+        }
+    </script>
+
+</body>
+</html>
