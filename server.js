@@ -14,8 +14,10 @@ const __dirname = path.dirname(__filename);
 const app = express();
 const client = new WebTorrent({ maxConns: 200, webSeeds: true });
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, '0.0.0.0', () => console.log(`Server running on port ${PORT}`));
 
+app.listen(PORT, '0.0.0.0', () => {
+    console.log(`🚀 Engine active on port ${PORT}`);
+});
 app.use(express.static(path.join(__dirname, 'public')));
 app.use(express.json());
 
