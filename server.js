@@ -12,12 +12,20 @@
 // const __dirname = path.dirname(__filename);
 
 // const app = express();
-// const client = new WebTorrent({ maxConns: 200, webSeeds: true });
 // const PORT = process.env.PORT || 3000;
+
+// // --- INITIALIZE WEBTORRENT WITH ERROR HANDLING ---
+// const client = new WebTorrent({ maxConns: 200, webSeeds: true });
+
+// // CRITICAL FIX 1: Prevent the entire server from crashing when WebTorrent encounters an issue
+// client.on('error', (err) => {
+//     console.error('⚠️ Global WebTorrent Error:', err.message);
+// });
 
 // app.listen(PORT, '0.0.0.0', () => {
 //     console.log(`🚀 Engine active on port ${PORT}`);
 // });
+
 // app.use(express.static(path.join(__dirname, 'public')));
 // app.use(express.json());
 
@@ -32,18 +40,46 @@
 // // --- 1. ADD MAGNET LINK ---
 // app.post('/api/add', (req, res) => {
 //     const { magnet } = req.body;
-//     if (!magnet) return res.status(400).json({ error: 'No magnet link provided' });
+//     if (!magnet || typeof magnet !== 'string') {
+//         return res.status(400).json({ error: 'No valid magnet link provided' });
+//     }
 
-//     if (currentTorrent) currentTorrent.destroy();
+//     // CRITICAL FIX 2: Prevent Zombie Torrents & Race Conditions
+//     // Instead of relying on `currentTorrent`, we wipe out ALL active torrents in the client.
+//     try {
+//         client.torrents.forEach(t => {
+//             try { t.destroy(); } catch (e) { /* Ignore destroy errors */ }
+//         });
+//         currentTorrent = null;
+//     } catch (err) {
+//         console.error('Cleanup error:', err.message);
+//     }
 
-//     client.add(magnet, { announce: announceList }, (torrent) => {
-//         currentTorrent = torrent;
-//         const file = torrent.files.find(f => f.name.endsWith('.mp4') || f.name.endsWith('.mkv') || f.name.endsWith('.webm'));
-//         if (!file) return res.status(400).json({ error: 'No playable video file found.' });
-        
-//         file.deselect();
-//         res.json({ message: 'Ready to stream', infoHash: torrent.infoHash });
-//     });
+//     // CRITICAL FIX 3: Catch synchronous errors from malformed magnet links
+//     try {
+//         client.add(magnet, { announce: announceList }, (torrent) => {
+//             currentTorrent = torrent;
+            
+//             // Catch torrent-specific errors (like bad tracker responses)
+//             torrent.on('error', (err) => {
+//                 console.error('⚠️ Torrent error:', err.message);
+//             });
+
+//             const file = torrent.files.find(f => f.name.endsWith('.mp4') || f.name.endsWith('.mkv') || f.name.endsWith('.webm'));
+            
+//             if (!file) {
+//                 torrent.destroy();
+//                 currentTorrent = null;
+//                 return res.status(400).json({ error: 'No playable video file found.' });
+//             }
+            
+//             file.deselect();
+//             res.json({ message: 'Ready to stream', infoHash: torrent.infoHash });
+//         });
+//     } catch (err) {
+//         console.error("Failed to add torrent:", err.message);
+//         return res.status(500).json({ error: "Invalid torrent or magnet link." });
+//     }
 // });
 
 // // --- 2. STREAMING & LIVE TRANSCODING ---
@@ -55,32 +91,37 @@
 //     const file = currentTorrent.files.find(f => f.name.endsWith('.mp4') || f.name.endsWith('.mkv') || f.name.endsWith('.webm'));
 //     if (!file) return res.status(404).send('File not found');
 
-//     const targetRes = req.query.res; // Grabs '480', '720', or 'source'
+//     const targetRes = req.query.res; 
 //     const range = req.headers.range;
 
 //     // -- Transcoding Logic --
 //     if (targetRes && targetRes !== 'source') {
 //         res.writeHead(200, { 'Content-Type': 'video/mp4' });
         
-//         // Grab the raw file stream
 //         const rawStream = file.createReadStream();
         
-//         // Pipe it through FFmpeg live
+//         // CRITICAL FIX 4: Prevent unhandled broken pipe errors
+//         rawStream.on('error', (err) => console.error("Raw stream error:", err.message));
+
 //         const transcodeStream = ffmpeg(rawStream)
 //             .videoCodec('libx264')
-//             .size(`?x${targetRes}`) // Automatically scales width, sets height to target
+//             .size(`?x${targetRes}`)
 //             .outputOptions([
-//                 '-movflags isml+frag_keyframe+empty_moov+faststart', // Forces immediate streaming
-//                 '-preset ultrafast', // Prevents buffering by maxing CPU speed
-//                 '-crf 28' // Compresses video to save bandwidth
+//                 '-movflags isml+frag_keyframe+empty_moov+faststart',
+//                 '-preset ultrafast',
+//                 '-crf 28'
 //             ])
 //             .format('mp4')
-//             .on('error', (err) => console.log('Transcode interrupted (usually due to user seeking/disconnecting)'))
+//             .on('error', (err) => {
+//                 // Ignore "Output stream closed" errors—this just means the user paused or closed the tab
+//                 if (!err.message.includes('Output stream closed')) {
+//                     console.log('Transcode interrupted:', err.message);
+//                 }
+//             })
 //             .pipe(res, { end: true });
 
-//         // Clean up when the user clicks away or closes the browser
 //         req.on('close', () => {
-//             rawStream.destroy();
+//             if (rawStream && !rawStream.destroyed) rawStream.destroy();
 //         });
 //         return;
 //     }
@@ -88,7 +129,9 @@
 //     // -- Normal Source Streaming (No Transcoding) --
 //     if (!range) {
 //         res.writeHead(200, { 'Content-Length': file.length, 'Content-Type': 'video/mp4' });
-//         file.createReadStream().pipe(res);
+//         const stream = file.createReadStream();
+//         stream.on('error', (err) => console.error("Stream error:", err.message));
+//         stream.pipe(res);
 //         return;
 //     }
 
@@ -105,10 +148,16 @@
 //     });
 
 //     const stream = file.createReadStream({ start, end });
+    
+//     // CRITICAL FIX 5: Handle range stream errors
+//     stream.on('error', (err) => {
+//         console.error("Stream range error:", err.message);
+//         if (!res.headersSent) res.status(500).end();
+//     });
+
 //     stream.pipe(res);
 
 //     const killStream = () => { if (!stream.destroyed) stream.destroy(); };
-//     stream.on('error', killStream);
 //     req.on('close', killStream);
 // });
 
@@ -128,8 +177,6 @@
 // // --- 4. DEVICE DETECTION & PLAYER ROUTING ---
 // app.get('/play', (req, res) => {
 //     const userAgent = req.headers['user-agent'] || '';
-    
-//     // Regex to detect Mobile devices
 //     const isMobile = /android|webos|iphone|ipad|ipod|blackberry|iemobile|opera mini/i.test(userAgent.toLowerCase());
 
 //     if (isMobile) {
@@ -138,7 +185,6 @@
 //         res.sendFile(path.join(__dirname, 'public/player/pcplayer.html'));
 //     }
 // });
-
 
 import express from 'express';
 import WebTorrent from 'webtorrent';
@@ -154,15 +200,8 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const app = express();
-const PORT = process.env.PORT || 3000;
-
-// --- INITIALIZE WEBTORRENT WITH ERROR HANDLING ---
 const client = new WebTorrent({ maxConns: 200, webSeeds: true });
-
-// CRITICAL FIX 1: Prevent the entire server from crashing when WebTorrent encounters an issue
-client.on('error', (err) => {
-    console.error('⚠️ Global WebTorrent Error:', err.message);
-});
+const PORT = process.env.PORT || 3000;
 
 app.listen(PORT, '0.0.0.0', () => {
     console.log(`🚀 Engine active on port ${PORT}`);
@@ -182,46 +221,18 @@ const announceList = [
 // --- 1. ADD MAGNET LINK ---
 app.post('/api/add', (req, res) => {
     const { magnet } = req.body;
-    if (!magnet || typeof magnet !== 'string') {
-        return res.status(400).json({ error: 'No valid magnet link provided' });
-    }
+    if (!magnet) return res.status(400).json({ error: 'No magnet link provided' });
 
-    // CRITICAL FIX 2: Prevent Zombie Torrents & Race Conditions
-    // Instead of relying on `currentTorrent`, we wipe out ALL active torrents in the client.
-    try {
-        client.torrents.forEach(t => {
-            try { t.destroy(); } catch (e) { /* Ignore destroy errors */ }
-        });
-        currentTorrent = null;
-    } catch (err) {
-        console.error('Cleanup error:', err.message);
-    }
+    if (currentTorrent) currentTorrent.destroy();
 
-    // CRITICAL FIX 3: Catch synchronous errors from malformed magnet links
-    try {
-        client.add(magnet, { announce: announceList }, (torrent) => {
-            currentTorrent = torrent;
-            
-            // Catch torrent-specific errors (like bad tracker responses)
-            torrent.on('error', (err) => {
-                console.error('⚠️ Torrent error:', err.message);
-            });
-
-            const file = torrent.files.find(f => f.name.endsWith('.mp4') || f.name.endsWith('.mkv') || f.name.endsWith('.webm'));
-            
-            if (!file) {
-                torrent.destroy();
-                currentTorrent = null;
-                return res.status(400).json({ error: 'No playable video file found.' });
-            }
-            
-            file.deselect();
-            res.json({ message: 'Ready to stream', infoHash: torrent.infoHash });
-        });
-    } catch (err) {
-        console.error("Failed to add torrent:", err.message);
-        return res.status(500).json({ error: "Invalid torrent or magnet link." });
-    }
+    client.add(magnet, { announce: announceList }, (torrent) => {
+        currentTorrent = torrent;
+        const file = torrent.files.find(f => f.name.endsWith('.mp4') || f.name.endsWith('.mkv') || f.name.endsWith('.webm'));
+        if (!file) return res.status(400).json({ error: 'No playable video file found.' });
+        
+        file.deselect();
+        res.json({ message: 'Ready to stream', infoHash: torrent.infoHash });
+    });
 });
 
 // --- 2. STREAMING & LIVE TRANSCODING ---
@@ -233,37 +244,32 @@ app.get('/api/stream/:infoHash', (req, res) => {
     const file = currentTorrent.files.find(f => f.name.endsWith('.mp4') || f.name.endsWith('.mkv') || f.name.endsWith('.webm'));
     if (!file) return res.status(404).send('File not found');
 
-    const targetRes = req.query.res; 
+    const targetRes = req.query.res; // Grabs '480', '720', or 'source'
     const range = req.headers.range;
 
     // -- Transcoding Logic --
     if (targetRes && targetRes !== 'source') {
         res.writeHead(200, { 'Content-Type': 'video/mp4' });
         
+        // Grab the raw file stream
         const rawStream = file.createReadStream();
         
-        // CRITICAL FIX 4: Prevent unhandled broken pipe errors
-        rawStream.on('error', (err) => console.error("Raw stream error:", err.message));
-
+        // Pipe it through FFmpeg live
         const transcodeStream = ffmpeg(rawStream)
             .videoCodec('libx264')
-            .size(`?x${targetRes}`)
+            .size(`?x${targetRes}`) // Automatically scales width, sets height to target
             .outputOptions([
-                '-movflags isml+frag_keyframe+empty_moov+faststart',
-                '-preset ultrafast',
-                '-crf 28'
+                '-movflags isml+frag_keyframe+empty_moov+faststart', // Forces immediate streaming
+                '-preset ultrafast', // Prevents buffering by maxing CPU speed
+                '-crf 28' // Compresses video to save bandwidth
             ])
             .format('mp4')
-            .on('error', (err) => {
-                // Ignore "Output stream closed" errors—this just means the user paused or closed the tab
-                if (!err.message.includes('Output stream closed')) {
-                    console.log('Transcode interrupted:', err.message);
-                }
-            })
+            .on('error', (err) => console.log('Transcode interrupted (usually due to user seeking/disconnecting)'))
             .pipe(res, { end: true });
 
+        // Clean up when the user clicks away or closes the browser
         req.on('close', () => {
-            if (rawStream && !rawStream.destroyed) rawStream.destroy();
+            rawStream.destroy();
         });
         return;
     }
@@ -271,9 +277,7 @@ app.get('/api/stream/:infoHash', (req, res) => {
     // -- Normal Source Streaming (No Transcoding) --
     if (!range) {
         res.writeHead(200, { 'Content-Length': file.length, 'Content-Type': 'video/mp4' });
-        const stream = file.createReadStream();
-        stream.on('error', (err) => console.error("Stream error:", err.message));
-        stream.pipe(res);
+        file.createReadStream().pipe(res);
         return;
     }
 
@@ -290,16 +294,10 @@ app.get('/api/stream/:infoHash', (req, res) => {
     });
 
     const stream = file.createReadStream({ start, end });
-    
-    // CRITICAL FIX 5: Handle range stream errors
-    stream.on('error', (err) => {
-        console.error("Stream range error:", err.message);
-        if (!res.headersSent) res.status(500).end();
-    });
-
     stream.pipe(res);
 
     const killStream = () => { if (!stream.destroyed) stream.destroy(); };
+    stream.on('error', killStream);
     req.on('close', killStream);
 });
 
@@ -319,6 +317,8 @@ app.get('/api/stats', (req, res) => {
 // --- 4. DEVICE DETECTION & PLAYER ROUTING ---
 app.get('/play', (req, res) => {
     const userAgent = req.headers['user-agent'] || '';
+    
+    // Regex to detect Mobile devices
     const isMobile = /android|webos|iphone|ipad|ipod|blackberry|iemobile|opera mini/i.test(userAgent.toLowerCase());
 
     if (isMobile) {
@@ -327,3 +327,4 @@ app.get('/play', (req, res) => {
         res.sendFile(path.join(__dirname, 'public/player/pcplayer.html'));
     }
 });
+
