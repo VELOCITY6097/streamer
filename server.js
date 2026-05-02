@@ -140,13 +140,12 @@
 // });
 
 
-
 import express from 'express';
 import WebTorrent from 'webtorrent';
 import path from 'path';
 import { fileURLToPath } from 'url';
 
-// --- FFMPEG ---
+// --- FFMPEG IMPORTS FOR LIVE TRANSCODING ---
 import ffmpeg from 'fluent-ffmpeg';
 import ffmpegInstaller from '@ffmpeg-installer/ffmpeg';
 ffmpeg.setFfmpegPath(ffmpegInstaller.path);
@@ -155,9 +154,15 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const app = express();
+const PORT = process.env.PORT || 3000;
+
+// --- INITIALIZE WEBTORRENT WITH ERROR HANDLING ---
 const client = new WebTorrent({ maxConns: 200, webSeeds: true });
 
-const PORT = process.env.PORT || 3000;
+// CRITICAL FIX 1: Prevent the entire server from crashing when WebTorrent encounters an issue
+client.on('error', (err) => {
+    console.error('⚠️ Global WebTorrent Error:', err.message);
+});
 
 app.listen(PORT, '0.0.0.0', () => {
     console.log(`🚀 Engine active on port ${PORT}`);
@@ -166,179 +171,155 @@ app.listen(PORT, '0.0.0.0', () => {
 app.use(express.static(path.join(__dirname, 'public')));
 app.use(express.json());
 
-// --- GLOBAL STATE ---
 let currentTorrent = null;
-let isAdding = false;
 
-// --- TRACKERS ---
 const announceList = [
     "udp://tracker.opentrackr.org:1337/announce",
     "udp://tracker.openbittorrent.com:80/announce",
     "wss://tracker.openwebtorrent.com"
 ];
 
-// --- ERROR HANDLING (prevents crash) ---
-client.on('error', err => {
-    console.log('⚠️ WebTorrent error:', err.message);
-});
-
-// --- HELPER: GET BEST VIDEO FILE ---
-function getVideoFile(torrent) {
-    return torrent.files
-        .filter(f => /\.(mp4|mkv|webm)$/i.test(f.name))
-        .sort((a, b) => b.length - a.length)[0]; // biggest file
-}
-
-// --- HELPER: ADD TORRENT ---
-function addTorrent(magnet, res) {
-    const existing = client.get(magnet);
-
-    if (existing) {
-        currentTorrent = existing;
-        isAdding = false;
-        return res.json({
-            message: 'Already loaded',
-            infoHash: existing.infoHash
-        });
-    }
-
-    client.add(magnet, { announce: announceList }, (torrent) => {
-        currentTorrent = torrent;
-
-        const file = getVideoFile(torrent);
-
-        if (!file) {
-            client.remove(torrent.infoHash);
-            isAdding = false;
-            return res.status(400).json({ error: 'No playable video file found.' });
-        }
-
-        file.deselect();
-
-        isAdding = false;
-        res.json({
-            message: 'Ready to stream',
-            infoHash: torrent.infoHash
-        });
-    });
-}
-
-// --- 1. ADD MAGNET ---
+// --- 1. ADD MAGNET LINK ---
 app.post('/api/add', (req, res) => {
     const { magnet } = req.body;
-
-    if (!magnet) {
-        return res.status(400).json({ error: 'No magnet link provided' });
+    if (!magnet || typeof magnet !== 'string') {
+        return res.status(400).json({ error: 'No valid magnet link provided' });
     }
 
-    if (isAdding) {
-        return res.json({ message: 'Already processing...' });
-    }
-
-    isAdding = true;
-
-    if (currentTorrent) {
-        client.remove(currentTorrent.infoHash, () => {
-            currentTorrent = null;
-            addTorrent(magnet, res);
+    // CRITICAL FIX 2: Prevent Zombie Torrents & Race Conditions
+    // Instead of relying on `currentTorrent`, we wipe out ALL active torrents in the client.
+    try {
+        client.torrents.forEach(t => {
+            try { t.destroy(); } catch (e) { /* Ignore destroy errors */ }
         });
-    } else {
-        addTorrent(magnet, res);
+        currentTorrent = null;
+    } catch (err) {
+        console.error('Cleanup error:', err.message);
+    }
+
+    // CRITICAL FIX 3: Catch synchronous errors from malformed magnet links
+    try {
+        client.add(magnet, { announce: announceList }, (torrent) => {
+            currentTorrent = torrent;
+            
+            // Catch torrent-specific errors (like bad tracker responses)
+            torrent.on('error', (err) => {
+                console.error('⚠️ Torrent error:', err.message);
+            });
+
+            const file = torrent.files.find(f => f.name.endsWith('.mp4') || f.name.endsWith('.mkv') || f.name.endsWith('.webm'));
+            
+            if (!file) {
+                torrent.destroy();
+                currentTorrent = null;
+                return res.status(400).json({ error: 'No playable video file found.' });
+            }
+            
+            file.deselect();
+            res.json({ message: 'Ready to stream', infoHash: torrent.infoHash });
+        });
+    } catch (err) {
+        console.error("Failed to add torrent:", err.message);
+        return res.status(500).json({ error: "Invalid torrent or magnet link." });
     }
 });
 
-// --- 2. STREAM ---
+// --- 2. STREAMING & LIVE TRANSCODING ---
 app.get('/api/stream/:infoHash', (req, res) => {
     if (!currentTorrent || currentTorrent.infoHash !== req.params.infoHash) {
         return res.status(404).send('Torrent not found');
     }
 
-    const file = getVideoFile(currentTorrent);
+    const file = currentTorrent.files.find(f => f.name.endsWith('.mp4') || f.name.endsWith('.mkv') || f.name.endsWith('.webm'));
     if (!file) return res.status(404).send('File not found');
 
-    const targetRes = req.query.res;
+    const targetRes = req.query.res; 
     const range = req.headers.range;
 
-    // --- TRANSCODING MODE ---
+    // -- Transcoding Logic --
     if (targetRes && targetRes !== 'source') {
         res.writeHead(200, { 'Content-Type': 'video/mp4' });
-
+        
         const rawStream = file.createReadStream();
+        
+        // CRITICAL FIX 4: Prevent unhandled broken pipe errors
+        rawStream.on('error', (err) => console.error("Raw stream error:", err.message));
 
-        const transcode = ffmpeg(rawStream)
+        const transcodeStream = ffmpeg(rawStream)
             .videoCodec('libx264')
             .size(`?x${targetRes}`)
             .outputOptions([
-                '-movflags frag_keyframe+empty_moov+faststart',
+                '-movflags isml+frag_keyframe+empty_moov+faststart',
                 '-preset ultrafast',
                 '-crf 28'
             ])
             .format('mp4')
-            .on('error', () => {})
+            .on('error', (err) => {
+                // Ignore "Output stream closed" errors—this just means the user paused or closed the tab
+                if (!err.message.includes('Output stream closed')) {
+                    console.log('Transcode interrupted:', err.message);
+                }
+            })
             .pipe(res, { end: true });
 
         req.on('close', () => {
-            rawStream.destroy();
-            if (transcode) transcode.destroy?.();
+            if (rawStream && !rawStream.destroyed) rawStream.destroy();
         });
-
         return;
     }
 
-    // --- NORMAL STREAM ---
+    // -- Normal Source Streaming (No Transcoding) --
     if (!range) {
-        res.writeHead(200, {
-            'Content-Length': file.length,
-            'Content-Type': 'video/mp4'
-        });
-        file.createReadStream().pipe(res);
+        res.writeHead(200, { 'Content-Length': file.length, 'Content-Type': 'video/mp4' });
+        const stream = file.createReadStream();
+        stream.on('error', (err) => console.error("Stream error:", err.message));
+        stream.pipe(res);
         return;
     }
 
     const parts = range.replace(/bytes=/, "").split("-");
     const start = parseInt(parts[0], 10);
     const end = parts[1] ? parseInt(parts[1], 10) : file.length - 1;
-    const chunkSize = (end - start) + 1;
+    const chunksize = (end - start) + 1;
 
     res.writeHead(206, {
         'Content-Range': `bytes ${start}-${end}/${file.length}`,
         'Accept-Ranges': 'bytes',
-        'Content-Length': chunkSize,
+        'Content-Length': chunksize,
         'Content-Type': 'video/mp4',
     });
 
     const stream = file.createReadStream({ start, end });
+    
+    // CRITICAL FIX 5: Handle range stream errors
+    stream.on('error', (err) => {
+        console.error("Stream range error:", err.message);
+        if (!res.headersSent) res.status(500).end();
+    });
+
     stream.pipe(res);
 
-    const cleanup = () => {
-        if (!stream.destroyed) stream.destroy();
-    };
-
-    stream.on('error', cleanup);
-    req.on('close', cleanup);
+    const killStream = () => { if (!stream.destroyed) stream.destroy(); };
+    req.on('close', killStream);
 });
 
-// --- 3. STATS ---
+// --- 3. TORRENT STATS ---
 app.get('/api/stats', (req, res) => {
-    if (!currentTorrent) {
-        return res.json({ status: 'idle' });
-    }
-
+    if (!currentTorrent) return res.json({ status: 'idle' });
     res.json({
-        status: 'downloading',
-        progress: currentTorrent.progress,
+        status: 'downloading', 
+        progress: currentTorrent.progress, 
         downloadSpeed: currentTorrent.downloadSpeed,
-        downloaded: currentTorrent.downloaded,
-        length: currentTorrent.length,
+        downloaded: currentTorrent.downloaded, 
+        length: currentTorrent.length, 
         numPeers: currentTorrent.numPeers
     });
 });
 
-// --- 4. PLAYER ROUTING ---
+// --- 4. DEVICE DETECTION & PLAYER ROUTING ---
 app.get('/play', (req, res) => {
-    const ua = req.headers['user-agent'] || '';
-
-    const isMobile = /android|iphone|ipad|ipod|opera mini|iemobile/i.test(ua.toLowerCase());
+    const userAgent = req.headers['user-agent'] || '';
+    const isMobile = /android|webos|iphone|ipad|ipod|blackberry|iemobile|opera mini/i.test(userAgent.toLowerCase());
 
     if (isMobile) {
         res.sendFile(path.join(__dirname, 'public/player/mobileplayer.html'));
