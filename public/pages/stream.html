@@ -1,0 +1,167 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Now Streaming</title>
+    <link rel="stylesheet" href="stream.css">
+    <!-- Import Lucide Icons -->
+    <script src="https://unpkg.com/lucide@latest"></script>
+</head>
+<body>
+
+    <!-- NEW: Ribbon Bar with Home Button -->
+    <div class="top-ribbon">
+        <!-- Directs up one folder to your main index.html -->
+        <a href="../index.html" class="nav-btn">
+            <i data-lucide="home"></i>
+            <span>Back to Home</span>
+        </a>
+    </div>
+
+    <div class="layout-container">
+        <!-- The frosted glass wrapper for the player -->
+        <div class="player-wrapper-glass">
+            <div class="player-container">
+                <iframe id="player-frame" allowfullscreen></iframe>
+            </div>
+        </div>
+
+        <!-- The Episode Sidebar -->
+        <div class="episode-sidebar">
+            <div class="sidebar-header">
+                Files / Episodes
+            </div>
+            <div class="episode-list" id="episode-list">
+                <div style="padding: 20px; text-align: center; color: #a1a1aa; font-size: 0.9rem;">
+                    Loading files...
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- The sleek glass status pill -->
+    <div id="status">Warming up the engines...</div>
+
+    <script>
+        // Render the Lucide icons
+        lucide.createIcons();
+
+        const urlParams = new URLSearchParams(window.location.search);
+        const infoHash = urlParams.get('hash');
+        const playerFrame = document.getElementById('player-frame');
+        const episodeListContainer = document.getElementById('episode-list');
+        const layoutContainer = document.querySelector('.layout-container');
+        const sidebar = document.querySelector('.episode-sidebar');
+
+        let currentFileIndex = 0; 
+        let availableEpisodes = [];
+
+        function loadPlayer(hash, fileIndex) {
+            currentFileIndex = fileIndex; 
+            playerFrame.src = `../player/pcplayer.html?hash=${hash}&file=${fileIndex}`;
+        }
+
+        window.addEventListener('message', (event) => {
+            if (event.data && event.data.type === 'EPISODE_ENDED') {
+                const currentIndexInArray = availableEpisodes.findIndex(ep => ep.originalIndex === Number(currentFileIndex));
+
+                if (currentIndexInArray !== -1 && currentIndexInArray < availableEpisodes.length - 1) {
+                    const nextEpisode = availableEpisodes[currentIndexInArray + 1];
+                    
+                    document.querySelectorAll('.episode-item').forEach(el => el.classList.remove('active'));
+                    const episodeUIItems = document.querySelectorAll('.episode-item');
+                    if (episodeUIItems[currentIndexInArray + 1]) {
+                        episodeUIItems[currentIndexInArray + 1].classList.add('active');
+                    }
+
+                    loadPlayer(infoHash, nextEpisode.originalIndex);
+                } else {
+                    console.log("Playlist finished. No more episodes.");
+                }
+            }
+        });
+
+        async function fetchTorrentFiles() {
+            try {
+                const response = await fetch(`/api/files/${infoHash}`);
+                const data = await response.json();
+
+                if (data.files && data.files.length > 0) {
+                    episodeListContainer.innerHTML = ''; 
+
+                    const videoExtensions = ['.mp4', '.mkv', '.avi', '.webm'];
+                    
+                    availableEpisodes = data.files.map((file, originalIndex) => ({
+                        ...file,
+                        originalIndex
+                    })).filter(file => videoExtensions.some(ext => file.name.toLowerCase().endsWith(ext)));
+
+                    if (availableEpisodes.length <= 1) {
+                        sidebar.style.display = 'none';
+                        layoutContainer.style.gridTemplateColumns = '1fr'; 
+                    }
+
+                    if (availableEpisodes.length === 0) {
+                        episodeListContainer.innerHTML = '<div style="padding: 20px; text-align: center; color: #a1a1aa;">No playable videos found.</div>';
+                        return;
+                    }
+
+                    availableEpisodes.forEach((file, displayIndex) => {
+                        const epNumber = displayIndex + 1;
+                        
+                        const item = document.createElement('div');
+                        item.className = 'episode-item';
+                        if (displayIndex === 0) item.classList.add('active'); 
+
+                        item.innerHTML = `
+                            <div class="episode-icon">${epNumber}</div>
+                            <div class="episode-title" title="${file.name}">${file.name}</div>
+                        `;
+
+                        item.addEventListener('click', () => {
+                            document.querySelectorAll('.episode-item').forEach(el => el.classList.remove('active'));
+                            item.classList.add('active');
+                            loadPlayer(infoHash, file.originalIndex);
+                        });
+
+                        episodeListContainer.appendChild(item);
+                    });
+
+                    loadPlayer(infoHash, availableEpisodes[0].originalIndex);
+
+                } else {
+                    sidebar.style.display = 'none';
+                    layoutContainer.style.gridTemplateColumns = '1fr';
+                    loadPlayer(infoHash, 0); 
+                }
+            } catch (err) {
+                console.error("Error fetching files:", err);
+                sidebar.style.display = 'none';
+                layoutContainer.style.gridTemplateColumns = '1fr';
+                loadPlayer(infoHash, 0);
+            }
+        }
+
+        if (!infoHash) {
+            document.getElementById('status').innerText = "Error: No hash provided in the link.";
+            episodeListContainer.innerHTML = '';
+        } else {
+            fetchTorrentFiles();
+
+            setInterval(async () => {
+                try {
+                    const response = await fetch('/api/stats');
+                    const data = await response.json();
+                    
+                    if (data.status === 'downloading') {
+                        const progress = (data.progress * 100).toFixed(1);
+                        const speed = (data.downloadSpeed / 1024 / 1024).toFixed(2);
+                        document.getElementById('status').innerText = `⚡ Streaming: ${progress}% | Speed: ${speed} MB/s`;
+                    }
+                } catch (err) {}
+            }, 1000);
+        }
+    </script>
+</body>
+</html>
